@@ -11,7 +11,13 @@ import {
   Rewind,
   Play,
   Pause,
-  Save
+  Save,
+  Target,
+  AlertTriangle,
+  X,
+  Plus,
+  Trash2,
+  Undo2
 } from 'lucide-react';
 
 // --- Helper Functions ---
@@ -40,34 +46,55 @@ const secondsToTime = (seconds) => {
 };
 
 const parseSRT = (srtText) => {
-  // Normalize line endings and split by double blank lines
   const blocks = srtText.trim().replace(/\r\n/g, '\n').split(/\n\s*\n/);
   const parsed = [];
+  const warnings = new Set(); // Use a set to prevent duplicate warnings
 
   blocks.forEach((block) => {
     const lines = block.split('\n');
-    if (lines.length >= 3) {
-      const id = lines[0].trim();
-      const timeLine = lines[1];
-      const timeMatch = timeLine.match(/(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})/);
+    const timeLineIndex = lines.findIndex(line => line.includes('-->'));
+    
+    if (timeLineIndex !== -1) {
+      let id = '';
+      if (timeLineIndex > 0) {
+        id = lines[0].trim();
+      } else {
+        warnings.add("Missing subtitle IDs were automatically recovered.");
+      }
+
+      const timeLine = lines[timeLineIndex];
+      const timeMatch = timeLine.match(/(\d{1,2}:\d{1,2}:\d{1,2}[.,]\d{1,3})\s*-->\s*(\d{1,2}:\d{1,2}:\d{1,2}[.,]\d{1,3})/);
       
       if (timeMatch) {
-        const startStr = timeMatch[1];
-        const endStr = timeMatch[2];
-        const text = lines.slice(2).join('\n');
+        if (timeMatch[1].includes('.') || timeMatch[2].includes('.')) {
+          warnings.add("Decimal points in timestamps were converted to commas.");
+        }
+        
+        const startStrRaw = timeMatch[1].replace('.', ',');
+        const endStrRaw = timeMatch[2].replace('.', ',');
+        
+        const standardFormatRegex = /^\d{2}:\d{2}:\d{2},\d{3}$/;
+        if (!standardFormatRegex.test(startStrRaw) || !standardFormatRegex.test(endStrRaw)) {
+          warnings.add("Non-standard timestamps (e.g. missing zeros) were standardized.");
+        }
+
+        const startSecs = timeToSeconds(startStrRaw) || 0;
+        const endSecs = timeToSeconds(endStrRaw) || 0;
+        
+        const text = lines.slice(timeLineIndex + 1).join('\n');
         
         parsed.push({
           id,
-          start: timeToSeconds(startStr) || 0,
-          end: timeToSeconds(endStr) || 0,
+          start: startSecs,
+          end: endSecs,
           text,
-          startStr,
-          endStr
+          startStr: secondsToTime(startSecs),
+          endStr: secondsToTime(endSecs)
         });
       }
     }
   });
-  return parsed;
+  return { parsed, warnings: Array.from(warnings) };
 };
 
 const stringifySRT = (subtitles) => {
@@ -89,6 +116,9 @@ export default function App() {
   const [globalShiftMs, setGlobalShiftMs] = useState(0);
   const [isDragging, setIsDragging] = useState(false);
   const [saveStatus, setSaveStatus] = useState('');
+  const [parseWarnings, setParseWarnings] = useState([]);
+  const [lastDeleted, setLastDeleted] = useState(null);
+  const [deletedTimeout, setDeletedTimeout] = useState(null);
   
   const videoRef = useRef(null);
   const subtitleListRef = useRef(null);
@@ -96,7 +126,6 @@ export default function App() {
   const fileInputSrt = useRef(null);
 
   // --- Autosave Effects ---
-  // Load from localStorage on mount
   useEffect(() => {
     const savedData = localStorage.getItem('subsync_pro_autosave');
     if (savedData) {
@@ -105,7 +134,7 @@ export default function App() {
         if (subs && subs.length > 0) {
           setSubtitles(subs);
           if (fileName) {
-            setSrtFile({ name: fileName }); // Mock file object just to preserve the export name
+            setSrtFile({ name: fileName });
           }
         }
       } catch (e) {
@@ -114,7 +143,6 @@ export default function App() {
     }
   }, []);
 
-  // Save to localStorage when subtitles change
   useEffect(() => {
     if (subtitles.length > 0) {
       const dataToSave = {
@@ -130,8 +158,6 @@ export default function App() {
 
   // --- Smooth Video Time Tracking ---
   useEffect(() => {
-    // The default onTimeUpdate event only fires ~4 times a second. 
-    // This high-frequency interval updates the time smoothly 25 times a second for precise millisecond display.
     const intervalId = setInterval(() => {
       if (videoRef.current && !videoRef.current.paused) {
         setCurrentTime(videoRef.current.currentTime);
@@ -154,14 +180,19 @@ export default function App() {
       setSrtFile(file);
       const reader = new FileReader();
       reader.onload = (event) => {
-        const parsedSubs = parseSRT(event.target.result);
-        setSubtitles(parsedSubs);
+        const { parsed, warnings } = parseSRT(event.target.result);
+        setSubtitles(parsed);
+        
+        if (warnings.length > 0) {
+          setParseWarnings(warnings);
+          // Auto-hide warnings after 8 seconds
+          setTimeout(() => setParseWarnings([]), 8000);
+        }
       };
       reader.readAsText(file);
     }
   };
 
-  // Handle Input Uploads
   const handleVideoUpload = (e) => processVideoFile(e.target.files[0]);
   const handleSrtUpload = (e) => processSrtFile(e.target.files[0]);
 
@@ -173,7 +204,6 @@ export default function App() {
 
   const handleDragLeave = (e) => {
     e.preventDefault();
-    // Only set dragging to false if we are leaving the main window area
     if (e.currentTarget.contains(e.relatedTarget)) return;
     setIsDragging(false);
   };
@@ -193,14 +223,12 @@ export default function App() {
     });
   };
 
-  // Video time update for seeking/scrubbing while paused
   const handleTimeUpdate = () => {
     if (videoRef.current && videoRef.current.paused) {
       setCurrentTime(videoRef.current.currentTime);
     }
   };
 
-  // Jump to subtitle
   const jumpToSubtitle = (time) => {
     if (videoRef.current) {
       videoRef.current.currentTime = time;
@@ -208,13 +236,83 @@ export default function App() {
     }
   };
 
-  // Adjust individual subtitle timing
+  const handleJumpToCurrentFragment = () => {
+    let targetSub = subtitles.find(sub => currentTime >= sub.start && currentTime <= sub.end);
+    
+    if (!targetSub) {
+      targetSub = subtitles.find(sub => sub.start > currentTime);
+    }
+
+    if (targetSub) {
+      const targetIndex = subtitles.indexOf(targetSub);
+      jumpToSubtitle(targetSub.start);
+      
+      const el = document.getElementById(`sub-${targetIndex}`);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    }
+  };
+
+  const handleAddSubtitle = (startTimeOverride = null) => {
+    let newStart = startTimeOverride !== null ? startTimeOverride : 0;
+    
+    // If adding to the end of the list
+    if (startTimeOverride === null && subtitles.length > 0) {
+      newStart = Math.max(...subtitles.map(s => s.end)) + 0.5;
+    }
+
+    const newEnd = newStart + 2.0; // Default duration of 2 seconds
+
+    const newSub = {
+      id: String(subtitles.length + 1),
+      start: newStart,
+      end: newEnd,
+      text: 'New Subtitle',
+      startStr: secondsToTime(newStart),
+      endStr: secondsToTime(newEnd)
+    };
+
+    const newSubs = [...subtitles, newSub].sort((a, b) => a.start - b.start);
+    setSubtitles(newSubs);
+
+    // Scroll the new subtitle into view
+    setTimeout(() => {
+      const newIndex = newSubs.findIndex(s => s === newSub);
+      const el = document.getElementById(`sub-${newIndex}`);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    }, 100);
+  };
+
+  const handleDeleteSubtitle = (indexToRemove) => {
+    const subToRemove = subtitles[indexToRemove];
+    setLastDeleted({ sub: subToRemove, index: indexToRemove });
+    
+    const newSubs = subtitles.filter((_, index) => index !== indexToRemove);
+    setSubtitles(newSubs);
+
+    if (deletedTimeout) clearTimeout(deletedTimeout);
+    const timer = setTimeout(() => setLastDeleted(null), 8000);
+    setDeletedTimeout(timer);
+  };
+
+  const handleUndoDelete = () => {
+    if (!lastDeleted) return;
+    const newSubs = [...subtitles];
+    const insertIndex = Math.min(lastDeleted.index, newSubs.length);
+    newSubs.splice(insertIndex, 0, lastDeleted.sub);
+    setSubtitles(newSubs);
+    setLastDeleted(null);
+    if (deletedTimeout) clearTimeout(deletedTimeout);
+  };
+
   const adjustTime = (index, field, deltaSeconds) => {
     const newSubs = [...subtitles];
     const sub = newSubs[index];
     sub[field] = Math.max(0, sub[field] + deltaSeconds);
     
-    // Ensure start isn't greater than end
     if (field === 'start' && sub.start > sub.end) sub.end = sub.start + 0.5;
     if (field === 'end' && sub.end < sub.start) sub.start = Math.max(0, sub.end - 0.5);
     
@@ -223,21 +321,18 @@ export default function App() {
     setSubtitles(newSubs);
   };
 
-  // Edit subtitle text
   const editSubtitleText = (index, newText) => {
     const newSubs = [...subtitles];
     newSubs[index].text = newText;
     setSubtitles(newSubs);
   };
 
-  // Handle raw string changes in time inputs
   const handleTimeStringChange = (index, field, value) => {
     const newSubs = [...subtitles];
     newSubs[index][`${field}Str`] = value;
     setSubtitles(newSubs);
   };
 
-  // Apply the manually typed time
   const applyTimeEdit = (index, field) => {
     const newSubs = [...subtitles];
     const sub = newSubs[index];
@@ -245,19 +340,16 @@ export default function App() {
     
     if (newSeconds !== null && !isNaN(newSeconds) && newSeconds >= 0) {
       sub[field] = newSeconds;
-      // Ensure start isn't greater than end
       if (field === 'start' && sub.start > sub.end) sub.end = sub.start + 0.5;
       if (field === 'end' && sub.end < sub.start) sub.start = Math.max(0, sub.end - 0.5);
     }
     
-    // Reformat string to strictly match format, or revert if invalid
     sub.startStr = secondsToTime(sub.start);
     sub.endStr = secondsToTime(sub.end);
     
     setSubtitles(newSubs);
   };
 
-  // Global Time Shift
   const applyGlobalShift = () => {
     if (globalShiftMs === 0) return;
     const deltaSeconds = globalShiftMs / 1000;
@@ -274,10 +366,9 @@ export default function App() {
       };
     });
     setSubtitles(newSubs);
-    setGlobalShiftMs(0); // Reset after apply
+    setGlobalShiftMs(0); 
   };
 
-  // Export SRT
   const exportSrt = () => {
     if (subtitles.length === 0) return;
     const srtString = stringifySRT(subtitles);
@@ -290,7 +381,6 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
-  // Find active subtitles
   const activeSubtitles = subtitles.filter(
     sub => currentTime >= sub.start && currentTime <= sub.end
   );
@@ -302,6 +392,46 @@ export default function App() {
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
+      {/* Undo Toast */}
+      {lastDeleted && (
+        <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-50 bg-slate-800 text-white px-5 py-3 rounded-xl shadow-2xl border border-slate-700 flex items-center space-x-6 animate-in slide-in-from-bottom-6 fade-in duration-300">
+          <span className="text-sm font-medium">Subtitle deleted.</span>
+          <div className="flex items-center space-x-2 border-l border-slate-700 pl-4">
+            <button 
+              onClick={handleUndoDelete}
+              className="flex items-center space-x-1 text-emerald-400 hover:text-emerald-300 font-medium px-2 py-1 rounded hover:bg-slate-700 transition-colors"
+            >
+              <Undo2 className="w-4 h-4" />
+              <span>Undo</span>
+            </button>
+            <button onClick={() => setLastDeleted(null)} className="text-slate-400 hover:text-white transition-colors p-1">
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Toast Warnings */}
+      {parseWarnings.length > 0 && (
+        <div className="absolute top-20 left-6 z-50 flex flex-col gap-2">
+          {parseWarnings.map((warning, idx) => (
+            <div key={idx} className="bg-amber-500/90 text-white px-4 py-3 rounded-lg shadow-lg shadow-amber-500/20 backdrop-blur border border-amber-400 flex items-start max-w-sm animate-in fade-in slide-in-from-top-4 transition-all">
+              <AlertTriangle className="w-5 h-5 mr-3 shrink-0 mt-0.5" />
+              <div className="flex-1">
+                <h4 className="font-bold text-sm mb-0.5 text-amber-50">Formatting Auto-Corrected</h4>
+                <p className="text-xs text-amber-100">{warning}</p>
+              </div>
+              <button 
+                onClick={() => setParseWarnings(warnings => warnings.filter((_, i) => i !== idx))} 
+                className="text-amber-200 hover:text-white transition-colors ml-2"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* Drag & Drop Overlay */}
       {isDragging && (
         <div className="absolute inset-0 z-50 bg-slate-950/80 backdrop-blur-sm border-4 border-dashed border-indigo-500 m-4 rounded-2xl flex flex-col items-center justify-center pointer-events-none">
@@ -337,8 +467,6 @@ export default function App() {
             <FileText className="w-4 h-4 text-emerald-400" />
             <span>Load SRT</span>
           </button>
-
-          
 
           <button 
             onClick={exportSrt} 
@@ -382,14 +510,36 @@ export default function App() {
                   )}
                 </div>
                 
-                {/* Current Video Time Display */}
-                <div className="mt-4 flex items-center space-x-3 bg-slate-900/80 backdrop-blur px-5 py-2.5 rounded-xl border border-slate-800 shadow-lg">
-                  <Clock className="w-5 h-5 text-indigo-400" />
-                  <span className="text-sm text-slate-400 font-medium uppercase tracking-wider">Video Time</span>
-                  <div className="h-4 w-px bg-slate-700"></div>
-                  <span className="font-mono text-xl font-semibold text-white tracking-wider">
-                    {secondsToTime(currentTime)}
-                  </span>
+                {/* Current Video Time Display & Controls */}
+                <div className="mt-4 flex flex-row items-center space-x-4">
+                  <div className="flex items-center space-x-3 bg-slate-900/80 backdrop-blur px-5 py-2.5 rounded-xl border border-slate-800 shadow-lg">
+                    <Clock className="w-5 h-5 text-indigo-400" />
+                    <span className="text-sm text-slate-400 font-medium uppercase tracking-wider">Video Time</span>
+                    <div className="h-4 w-px bg-slate-700"></div>
+                    <span className="font-mono text-xl font-semibold text-white tracking-wider">
+                      {secondsToTime(currentTime)}
+                    </span>
+                  </div>
+
+                  <button 
+                    onClick={() => handleAddSubtitle(currentTime)}
+                    className="flex items-center space-x-2 bg-indigo-600/20 hover:bg-indigo-600/30 px-4 py-2.5 rounded-xl border border-indigo-500/30 shadow-lg transition-colors text-indigo-300"
+                    title="Add subtitle at current video time"
+                  >
+                    <Plus className="w-5 h-5" />
+                    <span className="text-sm font-medium">Add Here</span>
+                  </button>
+
+                  {subtitles.length > 0 && (
+                    <button 
+                      onClick={handleJumpToCurrentFragment}
+                      className="flex items-center space-x-2 bg-slate-800 hover:bg-slate-700 px-4 py-2.5 rounded-xl border border-slate-700 shadow-lg transition-colors text-slate-300"
+                      title="Replay current fragment or jump to next"
+                    >
+                      <Target className="w-5 h-5 text-indigo-400" />
+                      <span className="text-sm font-medium">Jump to Current Fragment</span>
+                    </button>
+                  )}
                 </div>
               </div>
             ) : (
@@ -448,9 +598,18 @@ export default function App() {
               <FileText className="w-4 h-4" />
               <span>Subtitle Track</span>
             </h2>
-            <span className="text-xs font-mono text-slate-500 bg-slate-900 px-2 py-1 rounded">
-              {subtitles.length} segments
-            </span>
+            <div className="flex items-center space-x-3">
+              <span className="text-xs font-mono text-slate-500 bg-slate-900 px-2 py-1 rounded">
+                {subtitles.length} segments
+              </span>
+              <button
+                onClick={() => handleAddSubtitle(null)}
+                className="p-1.5 bg-indigo-600/20 text-indigo-400 hover:bg-indigo-600/40 hover:text-indigo-300 rounded transition-colors"
+                title="Add New Subtitle"
+              >
+                <Plus className="w-4 h-4" />
+              </button>
+            </div>
           </div>
           
           <div 
@@ -470,10 +629,20 @@ export default function App() {
                   }`}
                 >
                   <div className="flex items-center justify-between mb-3 text-xs font-mono text-slate-400">
-                    <span className="bg-slate-900 px-2 py-0.5 rounded border border-slate-800">#{index + 1}</span>
+                    <div className="flex items-center space-x-3">
+                      <span className="bg-slate-900 px-2 py-0.5 rounded border border-slate-800">#{index + 1}</span>
+                      <button 
+                        onClick={() => handleDeleteSubtitle(index)}
+                        className="flex items-center space-x-1 text-rose-400 hover:text-rose-300 transition-colors opacity-0 group-hover:opacity-100"
+                        title="Delete subtitle"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
                     <button 
                       onClick={() => jumpToSubtitle(sub.start)}
                       className="flex items-center space-x-1 text-indigo-400 hover:text-indigo-300 transition-colors opacity-0 group-hover:opacity-100"
+                      title="Jump to video time"
                     >
                       <Play className="w-3 h-3" />
                       <span>Jump</span>
