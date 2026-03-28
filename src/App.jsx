@@ -10,14 +10,16 @@ import {
   FastForward,
   Rewind,
   Play,
-  Pause,
-  Save,
   Target,
   AlertTriangle,
   X,
   Plus,
   Trash2,
-  Undo2
+  Undo2,
+  Sparkles,
+  Loader2,
+  Activity,
+  Cpu
 } from 'lucide-react';
 
 // --- Helper Functions ---
@@ -48,7 +50,7 @@ const secondsToTime = (seconds) => {
 const parseSRT = (srtText) => {
   const blocks = srtText.trim().replace(/\r\n/g, '\n').split(/\n\s*\n/);
   const parsed = [];
-  const warnings = new Set(); // Use a set to prevent duplicate warnings
+  const warnings = new Set(); 
 
   blocks.forEach((block) => {
     const lines = block.split('\n');
@@ -105,6 +107,84 @@ const stringifySRT = (subtitles) => {
   }).join('\n\n') + '\n';
 };
 
+// --- Web Worker for Chunked Streaming Whisper AI ---
+const whisperWorkerCode = `
+import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.16.0/dist/transformers.min.js';
+env.allowLocalModels = false;
+
+let transcriber = null;
+let currentModelName = null;
+
+self.onmessage = async (e) => {
+  const { audio, language, modelName } = e.data;
+  
+  try {
+    // If the model changed or hasn't been loaded yet, download it.
+    if (!transcriber || currentModelName !== modelName) {
+      self.postMessage({ status: 'loading', message: \`Downloading \${modelName.split('/')[1]} (only happens once)...\` });
+      transcriber = await pipeline('automatic-speech-recognition', modelName, {
+        progress_callback: (info) => {
+          self.postMessage({ status: 'progress', info });
+        }
+      });
+      currentModelName = modelName;
+    }
+
+    self.postMessage({ status: 'extracting', message: 'Preparing audio chunks...' });
+    
+    const sampleRate = 16000;
+    const chunkSizeSec = 30;
+    const chunkSize = chunkSizeSec * sampleRate;
+    const totalChunks = Math.ceil(audio.length / chunkSize);
+    
+    for (let i = 0; i < totalChunks; i++) {
+        const startIdx = i * chunkSize;
+        const endIdx = Math.min((i + 1) * chunkSize, audio.length);
+        const audioChunk = audio.slice(startIdx, endIdx);
+        
+        self.postMessage({ 
+            status: 'processing_chunk', 
+            current: i + 1, 
+            total: totalChunks, 
+            message: \`Transcribing chunk \${i + 1} of \${totalChunks}...\` 
+        });
+        
+        const result = await transcriber(audioChunk, {
+            language: language,
+            task: 'transcribe',
+            return_timestamps: true,
+            repetition_penalty: 1.15 // <-- Prevents the "ongaku" infinite loops!
+        });
+        
+        const timeOffset = i * chunkSizeSec;
+        
+        if (result.chunks) {
+            const adjustedChunks = result.chunks.map(c => {
+                const cStart = c.timestamp[0];
+                const cEnd = c.timestamp[1] !== null ? c.timestamp[1] : cStart + 2.0;
+                return {
+                    text: c.text,
+                    start: cStart + timeOffset,
+                    end: cEnd + timeOffset
+                };
+            });
+            self.postMessage({ status: 'chunk_result', chunks: adjustedChunks });
+        } else if (result.text && result.text.trim().length > 0) {
+            self.postMessage({ status: 'chunk_result', chunks: [{
+                text: result.text,
+                start: timeOffset,
+                end: timeOffset + 30.0
+            }]});
+        }
+    }
+
+    self.postMessage({ status: 'complete', message: 'Transcription finished!' });
+  } catch (error) {
+    self.postMessage({ status: 'error', error: error.message });
+  }
+};
+`;
+
 // --- Main Component ---
 
 export default function App() {
@@ -119,6 +199,13 @@ export default function App() {
   const [parseWarnings, setParseWarnings] = useState([]);
   const [lastDeleted, setLastDeleted] = useState(null);
   const [deletedTimeout, setDeletedTimeout] = useState(null);
+  
+  // Streaming Transcription States
+  const [showConfigModal, setShowConfigModal] = useState(false);
+  const [selectedLanguage, setSelectedLanguage] = useState('english');
+  const [selectedModel, setSelectedModel] = useState('Xenova/whisper-base'); // Base is the new default
+  const [transcribingJob, setTranscribingJob] = useState(null); 
+  const workerRef = useRef(null);
   
   const videoRef = useRef(null);
   const subtitleListRef = useRef(null);
@@ -141,6 +228,10 @@ export default function App() {
         console.error("Failed to load autosave", e);
       }
     }
+
+    return () => {
+      if (workerRef.current) workerRef.current.terminate();
+    };
   }, []);
 
   useEffect(() => {
@@ -150,24 +241,23 @@ export default function App() {
         fileName: srtFile ? srtFile.name : 'synced_subtitles.srt'
       };
       localStorage.setItem('subsync_pro_autosave', JSON.stringify(dataToSave));
-      setSaveStatus('Autosaved just now');
+      setSaveStatus('Autosaved');
       const timer = setTimeout(() => setSaveStatus(''), 3000);
       return () => clearTimeout(timer);
     }
   }, [subtitles, srtFile]);
 
-  // --- Smooth Video Time Tracking ---
+  // --- Video Tracking ---
   useEffect(() => {
     const intervalId = setInterval(() => {
       if (videoRef.current && !videoRef.current.paused) {
         setCurrentTime(videoRef.current.currentTime);
       }
     }, 40); 
-    
     return () => clearInterval(intervalId);
   }, []);
 
-  // File Processors
+  // --- Handlers ---
   const processVideoFile = (file) => {
     if (file) {
       setVideoFile(file);
@@ -185,7 +275,6 @@ export default function App() {
         
         if (warnings.length > 0) {
           setParseWarnings(warnings);
-          // Auto-hide warnings after 8 seconds
           setTimeout(() => setParseWarnings([]), 8000);
         }
       };
@@ -196,7 +285,6 @@ export default function App() {
   const handleVideoUpload = (e) => processVideoFile(e.target.files[0]);
   const handleSrtUpload = (e) => processSrtFile(e.target.files[0]);
 
-  // Drag and Drop Handlers
   const handleDragOver = (e) => {
     e.preventDefault();
     setIsDragging(true);
@@ -211,7 +299,6 @@ export default function App() {
   const handleDrop = (e) => {
     e.preventDefault();
     setIsDragging(false);
-    
     const files = Array.from(e.dataTransfer.files);
     files.forEach(file => {
       const fileName = file.name.toLowerCase();
@@ -223,12 +310,6 @@ export default function App() {
     });
   };
 
-  const handleTimeUpdate = () => {
-    if (videoRef.current && videoRef.current.paused) {
-      setCurrentTime(videoRef.current.currentTime);
-    }
-  };
-
   const jumpToSubtitle = (time) => {
     if (videoRef.current) {
       videoRef.current.currentTime = time;
@@ -238,15 +319,12 @@ export default function App() {
 
   const handleJumpToCurrentFragment = () => {
     let targetSub = subtitles.find(sub => currentTime >= sub.start && currentTime <= sub.end);
-    
     if (!targetSub) {
       targetSub = subtitles.find(sub => sub.start > currentTime);
     }
-
     if (targetSub) {
       const targetIndex = subtitles.indexOf(targetSub);
       jumpToSubtitle(targetSub.start);
-      
       const el = document.getElementById(`sub-${targetIndex}`);
       if (el) {
         el.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -256,14 +334,10 @@ export default function App() {
 
   const handleAddSubtitle = (startTimeOverride = null) => {
     let newStart = startTimeOverride !== null ? startTimeOverride : 0;
-    
-    // If adding to the end of the list
     if (startTimeOverride === null && subtitles.length > 0) {
       newStart = Math.max(...subtitles.map(s => s.end)) + 0.5;
     }
-
-    const newEnd = newStart + 2.0; // Default duration of 2 seconds
-
+    const newEnd = newStart + 2.0;
     const newSub = {
       id: String(subtitles.length + 1),
       start: newStart,
@@ -272,27 +346,15 @@ export default function App() {
       startStr: secondsToTime(newStart),
       endStr: secondsToTime(newEnd)
     };
-
     const newSubs = [...subtitles, newSub].sort((a, b) => a.start - b.start);
     setSubtitles(newSubs);
-
-    // Scroll the new subtitle into view
-    setTimeout(() => {
-      const newIndex = newSubs.findIndex(s => s === newSub);
-      const el = document.getElementById(`sub-${newIndex}`);
-      if (el) {
-        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      }
-    }, 100);
   };
 
   const handleDeleteSubtitle = (indexToRemove) => {
     const subToRemove = subtitles[indexToRemove];
     setLastDeleted({ sub: subToRemove, index: indexToRemove });
-    
     const newSubs = subtitles.filter((_, index) => index !== indexToRemove);
     setSubtitles(newSubs);
-
     if (deletedTimeout) clearTimeout(deletedTimeout);
     const timer = setTimeout(() => setLastDeleted(null), 8000);
     setDeletedTimeout(timer);
@@ -312,10 +374,8 @@ export default function App() {
     const newSubs = [...subtitles];
     const sub = newSubs[index];
     sub[field] = Math.max(0, sub[field] + deltaSeconds);
-    
     if (field === 'start' && sub.start > sub.end) sub.end = sub.start + 0.5;
     if (field === 'end' && sub.end < sub.start) sub.start = Math.max(0, sub.end - 0.5);
-    
     sub.startStr = secondsToTime(sub.start);
     sub.endStr = secondsToTime(sub.end);
     setSubtitles(newSubs);
@@ -337,23 +397,19 @@ export default function App() {
     const newSubs = [...subtitles];
     const sub = newSubs[index];
     const newSeconds = timeToSeconds(sub[`${field}Str`]);
-    
     if (newSeconds !== null && !isNaN(newSeconds) && newSeconds >= 0) {
       sub[field] = newSeconds;
       if (field === 'start' && sub.start > sub.end) sub.end = sub.start + 0.5;
       if (field === 'end' && sub.end < sub.start) sub.start = Math.max(0, sub.end - 0.5);
     }
-    
     sub.startStr = secondsToTime(sub.start);
     sub.endStr = secondsToTime(sub.end);
-    
     setSubtitles(newSubs);
   };
 
   const applyGlobalShift = () => {
     if (globalShiftMs === 0) return;
     const deltaSeconds = globalShiftMs / 1000;
-    
     const newSubs = subtitles.map(sub => {
       const newStart = Math.max(0, sub.start + deltaSeconds);
       const newEnd = Math.max(0, sub.end + deltaSeconds);
@@ -381,6 +437,106 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
+  // --- Auto-Transcription Streaming Logic ---
+  const extractAudioFromVideo = async (file) => {
+    try {
+      const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+      const arrayBuffer = await file.arrayBuffer();
+      const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+      return audioBuffer.getChannelData(0);
+    } catch (err) {
+      throw new Error("Failed to extract audio. The file might be corrupted.");
+    }
+  };
+
+  const handleChunkResult = (newChunks) => {
+    setSubtitles(prev => {
+      const startId = prev.length + 1;
+      const newSubs = newChunks.map((c, idx) => ({
+        id: String(startId + idx),
+        start: c.start,
+        end: c.end,
+        text: c.text.trim(),
+        startStr: secondsToTime(c.start),
+        endStr: secondsToTime(c.end)
+      }));
+      return [...prev, ...newSubs];
+    });
+
+    // Auto-scroll track softly
+    setTimeout(() => {
+      if (subtitleListRef.current) {
+        subtitleListRef.current.scrollTo({
+          top: subtitleListRef.current.scrollHeight,
+          behavior: 'smooth'
+        });
+      }
+    }, 100);
+  };
+
+  const startTranscription = async () => {
+    if (!videoFile) return;
+    setShowConfigModal(false);
+    setTranscribingJob({ title: 'Preparing Audio', message: 'Extracting track from video...', progress: 0 });
+
+    try {
+      const audioData = await extractAudioFromVideo(videoFile);
+      
+      if (!workerRef.current) {
+        const blob = new Blob([whisperWorkerCode], { type: 'application/javascript' });
+        const workerUrl = URL.createObjectURL(blob);
+        workerRef.current = new Worker(workerUrl, { type: 'module' });
+        
+        workerRef.current.onmessage = (e) => {
+          const { status, message, info, chunks, current, total, error } = e.data;
+          
+          if (status === 'loading') {
+            setTranscribingJob(prev => ({ ...prev, title: 'Downloading Model', message: message }));
+          } else if (status === 'progress') {
+            if (info && info.progress) {
+              setTranscribingJob(prev => ({ ...prev, progress: Math.round(info.progress) }));
+            }
+          } else if (status === 'extracting') {
+             setTranscribingJob(prev => ({ ...prev, title: 'Processing', message: message, progress: 0 }));
+          } else if (status === 'processing_chunk') {
+            setTranscribingJob({ 
+              title: 'Generating Subtitles', 
+              message: message, 
+              progress: (current / total) * 100 
+            });
+          } else if (status === 'chunk_result') {
+            handleChunkResult(chunks);
+          } else if (status === 'complete') {
+            setTranscribingJob(null);
+            setSaveStatus('Transcription Complete');
+            setTimeout(() => setSaveStatus(''), 4000);
+          } else if (status === 'error') {
+            setTranscribingJob(null);
+            setParseWarnings([`Transcription Error: ${error}`]);
+          }
+        };
+      }
+
+      workerRef.current.postMessage({
+        audio: audioData,
+        language: selectedLanguage,
+        modelName: selectedModel // Send chosen model to the worker
+      });
+
+    } catch (err) {
+      setTranscribingJob(null);
+      setParseWarnings([err.message]);
+    }
+  };
+
+  const cancelTranscription = () => {
+    if (workerRef.current) {
+      workerRef.current.terminate();
+      workerRef.current = null;
+    }
+    setTranscribingJob(null);
+  };
+
   const activeSubtitles = subtitles.filter(
     sub => currentTime >= sub.start && currentTime <= sub.end
   );
@@ -392,6 +548,73 @@ export default function App() {
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
+      {/* Configuration Modal */}
+      {showConfigModal && (
+        <div className="absolute inset-0 z-[100] bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl max-w-md w-full p-6 flex flex-col animate-in zoom-in-95 duration-200">
+            <div className="flex items-center justify-between mb-6">
+              <h3 className="text-xl font-bold text-white flex items-center space-x-2">
+                <Sparkles className="w-5 h-5 text-indigo-400" />
+                <span>Magic Transcribe</span>
+              </h3>
+              <button onClick={() => setShowConfigModal(false)} className="text-slate-400 hover:text-white">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            
+            <p className="text-sm text-slate-400 mb-6">
+              Generate subtitles locally. You can watch the video and edit subtitles live as they stream in!
+            </p>
+
+            <div className="space-y-4 mb-8">
+              <div className="space-y-2">
+                <label className="text-sm font-semibold text-slate-300">Spoken Language</label>
+                <select 
+                  value={selectedLanguage}
+                  onChange={(e) => setSelectedLanguage(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2.5 text-slate-200 focus:outline-none focus:border-indigo-500 transition-colors"
+                >
+                  <option value="english">English</option>
+                  <option value="japanese">Japanese</option>
+                  <option value="spanish">Spanish</option>
+                  <option value="french">French</option>
+                  <option value="german">German</option>
+                  <option value="chinese">Chinese</option>
+                  <option value="korean">Korean</option>
+                </select>
+              </div>
+
+              <div className="space-y-2">
+                <label className="flex items-center space-x-2 text-sm font-semibold text-slate-300">
+                  <Cpu className="w-4 h-4 text-slate-400" />
+                  <span>AI Model Accuracy</span>
+                </label>
+                <select 
+                  value={selectedModel}
+                  onChange={(e) => setSelectedModel(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2.5 text-slate-200 focus:outline-none focus:border-indigo-500 transition-colors"
+                >
+                  <option value="Xenova/whisper-tiny">Tiny (Fastest, prone to loops)</option>
+                  <option value="Xenova/whisper-base">Base (Recommended, good balance)</option>
+                  <option value="Xenova/whisper-small">Small (High accuracy, slower generation)</option>
+                </select>
+                <p className="text-xs text-slate-500">Larger models take a bit longer to download initially but reduce hallucinations and missed words.</p>
+              </div>
+            </div>
+
+            <div className="flex space-x-3">
+              <button onClick={() => setShowConfigModal(false)} className="flex-1 py-3 bg-slate-800 hover:bg-slate-700 rounded-lg font-medium transition-colors">
+                Cancel
+              </button>
+              <button onClick={startTranscription} className="flex-1 py-3 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg font-medium shadow-lg shadow-indigo-500/20 transition-all flex justify-center items-center space-x-2">
+                <Activity className="w-4 h-4" />
+                <span>Start Streaming</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Undo Toast */}
       {lastDeleted && (
         <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-50 bg-slate-800 text-white px-5 py-3 rounded-xl shadow-2xl border border-slate-700 flex items-center space-x-6 animate-in slide-in-from-bottom-6 fade-in duration-300">
@@ -418,7 +641,7 @@ export default function App() {
             <div key={idx} className="bg-amber-500/90 text-white px-4 py-3 rounded-lg shadow-lg shadow-amber-500/20 backdrop-blur border border-amber-400 flex items-start max-w-sm animate-in fade-in slide-in-from-top-4 transition-all">
               <AlertTriangle className="w-5 h-5 mr-3 shrink-0 mt-0.5" />
               <div className="flex-1">
-                <h4 className="font-bold text-sm mb-0.5 text-amber-50">Formatting Auto-Corrected</h4>
+                <h4 className="font-bold text-sm mb-0.5 text-amber-50">Notice</h4>
                 <p className="text-xs text-amber-100">{warning}</p>
               </div>
               <button 
@@ -442,7 +665,7 @@ export default function App() {
       )}
 
       {/* Header */}
-      <header className="bg-slate-950 border-b border-slate-800 px-6 py-4 flex items-center justify-between shadow-md shrink-0">
+      <header className="bg-slate-950 border-b border-slate-800 px-6 py-4 flex items-center justify-between shadow-md shrink-0 z-20">
         <div className="flex items-center space-x-3">
           <Clock className="text-indigo-500 w-6 h-6" />
           <h1 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-indigo-400 to-cyan-400">
@@ -458,15 +681,29 @@ export default function App() {
               {saveStatus}
             </span>
           )}
+          
           <button onClick={() => fileInputVideo.current.click()} className="flex items-center space-x-2 px-4 py-2 bg-slate-800 hover:bg-slate-700 rounded-lg text-sm font-medium transition-colors border border-slate-700">
             <Video className="w-4 h-4 text-cyan-400" />
             <span>Load Video</span>
           </button>
           
-          <button onClick={() => fileInputSrt.current.click()} className="flex items-center space-x-2 px-4 py-2 bg-slate-800 hover:bg-slate-700 rounded-lg text-sm font-medium transition-colors border border-slate-700">
-            <FileText className="w-4 h-4 text-emerald-400" />
-            <span>Load SRT</span>
-          </button>
+          <div className="flex items-center bg-slate-800 rounded-lg border border-slate-700 overflow-hidden">
+            <button onClick={() => fileInputSrt.current.click()} className="flex items-center space-x-2 px-4 py-2 hover:bg-slate-700 text-sm font-medium transition-colors border-r border-slate-700">
+              <FileText className="w-4 h-4 text-emerald-400" />
+              <span>Load SRT</span>
+            </button>
+            <button 
+              onClick={() => setShowConfigModal(true)}
+              disabled={!videoFile || transcribingJob !== null}
+              className={`flex items-center space-x-2 px-4 py-2 text-sm font-medium transition-colors ${
+                videoFile && !transcribingJob ? 'hover:bg-slate-700 text-indigo-300' : 'opacity-50 cursor-not-allowed text-slate-500'
+              }`}
+              title={videoFile ? "Auto-transcribe video" : "Load a video first to transcribe"}
+            >
+              <Sparkles className="w-4 h-4" />
+              <span>Transcribe</span>
+            </button>
+          </div>
 
           <button 
             onClick={exportSrt} 
@@ -480,6 +717,37 @@ export default function App() {
           </button>
         </div>
       </header>
+
+      {/* Transcription Active Banner */}
+      {transcribingJob && (
+        <div className="bg-indigo-950/80 backdrop-blur border-b border-indigo-500/30 px-6 py-2.5 flex items-center justify-between shrink-0 animate-in slide-in-from-top-2 z-10">
+           <div className="flex items-center space-x-4 flex-[0.3]">
+               <Loader2 className="w-5 h-5 text-indigo-400 animate-spin" />
+               <div className="flex flex-col">
+                   <h4 className="text-sm font-semibold text-indigo-200 leading-tight">{transcribingJob.title}</h4>
+                   <p className="text-xs text-indigo-300/80 truncate leading-tight mt-0.5">{transcribingJob.message}</p>
+               </div>
+           </div>
+           
+           <div className="flex-1 mx-8 flex items-center space-x-4 max-w-xl">
+               <div className="flex-1 bg-slate-900/80 rounded-full h-2.5 overflow-hidden border border-indigo-900/50">
+                  <div 
+                    className="bg-gradient-to-r from-indigo-500 to-cyan-400 h-full transition-all duration-300 rounded-full" 
+                    style={{ width: `${transcribingJob.progress || 0}%` }} 
+                  />
+               </div>
+               <span className="text-xs text-indigo-300 font-mono w-8 text-right shrink-0">{Math.round(transcribingJob.progress || 0)}%</span>
+           </div>
+
+           <button 
+              onClick={cancelTranscription} 
+              className="flex items-center space-x-1 px-3 py-1.5 bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/20 rounded-md text-xs font-medium transition-colors"
+            >
+               <X className="w-3 h-3" />
+               <span>Stop</span>
+           </button>
+        </div>
+      )}
 
       {/* Main Workspace */}
       <main className="flex-1 flex overflow-hidden min-h-0">
@@ -495,7 +763,9 @@ export default function App() {
                     src={videoUrl}
                     className="w-full aspect-video outline-none"
                     controls
-                    onTimeUpdate={handleTimeUpdate}
+                    onTimeUpdate={() => {
+                      if (videoRef.current && videoRef.current.paused) setCurrentTime(videoRef.current.currentTime);
+                    }}
                   />
                   
                   {/* On-video Subtitle Overlay */}
@@ -514,7 +784,7 @@ export default function App() {
                 <div className="mt-4 flex flex-row items-center space-x-4">
                   <div className="flex items-center space-x-3 bg-slate-900/80 backdrop-blur px-5 py-2.5 rounded-xl border border-slate-800 shadow-lg">
                     <Clock className="w-5 h-5 text-indigo-400" />
-                    <span className="text-sm text-slate-400 font-medium uppercase tracking-wider">Video Time</span>
+                    <span className="text-sm text-slate-400 font-medium uppercase tracking-wider">Time</span>
                     <div className="h-4 w-px bg-slate-700"></div>
                     <span className="font-mono text-xl font-semibold text-white tracking-wider">
                       {secondsToTime(currentTime)}
@@ -524,7 +794,6 @@ export default function App() {
                   <button 
                     onClick={() => handleAddSubtitle(currentTime)}
                     className="flex items-center space-x-2 bg-indigo-600/20 hover:bg-indigo-600/30 px-4 py-2.5 rounded-xl border border-indigo-500/30 shadow-lg transition-colors text-indigo-300"
-                    title="Add subtitle at current video time"
                   >
                     <Plus className="w-5 h-5" />
                     <span className="text-sm font-medium">Add Here</span>
@@ -534,10 +803,9 @@ export default function App() {
                     <button 
                       onClick={handleJumpToCurrentFragment}
                       className="flex items-center space-x-2 bg-slate-800 hover:bg-slate-700 px-4 py-2.5 rounded-xl border border-slate-700 shadow-lg transition-colors text-slate-300"
-                      title="Replay current fragment or jump to next"
                     >
                       <Target className="w-5 h-5 text-indigo-400" />
-                      <span className="text-sm font-medium">Jump to Current Fragment</span>
+                      <span className="text-sm font-medium">Jump to Subtitle</span>
                     </button>
                   )}
                 </div>
@@ -558,49 +826,50 @@ export default function App() {
 
           {/* Global Tools Panel */}
           {subtitles.length > 0 && (
-            <div className="h-40 border-t border-slate-800 bg-slate-900 p-6 flex flex-col justify-center">
-              <h3 className="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-4">Global Timing Shift</h3>
-              <div className="flex items-center space-x-4">
-                <div className="flex items-center space-x-2 bg-slate-950 border border-slate-800 rounded-lg p-1">
-                  <button onClick={() => setGlobalShiftMs(prev => prev - 100)} className="p-2 hover:bg-slate-800 rounded text-rose-400" title="Decrease by 100ms">
-                    <Rewind className="w-4 h-4" />
-                  </button>
-                  <input 
-                    type="number" 
-                    value={globalShiftMs} 
-                    onChange={(e) => setGlobalShiftMs(Number(e.target.value))}
-                    className="w-24 bg-transparent text-center outline-none font-mono text-sm"
-                  />
-                  <span className="text-slate-500 text-sm">ms</span>
-                  <button onClick={() => setGlobalShiftMs(prev => prev + 100)} className="p-2 hover:bg-slate-800 rounded text-emerald-400" title="Increase by 100ms">
-                    <FastForward className="w-4 h-4" />
-                  </button>
+            <div className="h-32 border-t border-slate-800 bg-slate-900 p-6 flex flex-col justify-center shrink-0">
+              <div className="flex items-center space-x-6">
+                <div>
+                  <h3 className="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-2">Global Timing Shift</h3>
+                  <div className="flex items-center space-x-4">
+                    <div className="flex items-center space-x-2 bg-slate-950 border border-slate-800 rounded-lg p-1">
+                      <button onClick={() => setGlobalShiftMs(prev => prev - 100)} className="p-2 hover:bg-slate-800 rounded text-rose-400">
+                        <Rewind className="w-4 h-4" />
+                      </button>
+                      <input 
+                        type="number" 
+                        value={globalShiftMs} 
+                        onChange={(e) => setGlobalShiftMs(Number(e.target.value))}
+                        className="w-20 bg-transparent text-center outline-none font-mono text-sm"
+                      />
+                      <span className="text-slate-500 text-sm">ms</span>
+                      <button onClick={() => setGlobalShiftMs(prev => prev + 100)} className="p-2 hover:bg-slate-800 rounded text-emerald-400">
+                        <FastForward className="w-4 h-4" />
+                      </button>
+                    </div>
+                    <button 
+                      onClick={applyGlobalShift}
+                      disabled={globalShiftMs === 0}
+                      className="px-4 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-sm font-medium transition-colors border border-slate-700"
+                    >
+                      Apply Shift
+                    </button>
+                  </div>
                 </div>
-                <button 
-                  onClick={applyGlobalShift}
-                  disabled={globalShiftMs === 0}
-                  className="px-4 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-sm font-medium transition-colors border border-slate-700"
-                >
-                  Apply to All Subtitles
-                </button>
               </div>
-              <p className="text-xs text-slate-500 mt-2">
-                Shift all subtitles forwards or backwards in time. Positive values delay subtitles, negative values make them appear earlier.
-              </p>
             </div>
           )}
         </section>
 
         {/* Right Panel: Subtitle List */}
-        <section className="w-[450px] border-l border-slate-800 flex flex-col bg-slate-900 z-10 shadow-xl shadow-black/50">
+        <section className="w-[450px] border-l border-slate-800 flex flex-col bg-slate-900 z-10 shadow-xl shadow-black/50 shrink-0">
           <div className="p-4 border-b border-slate-800 bg-slate-950 flex justify-between items-center">
             <h2 className="font-semibold text-slate-300 flex items-center space-x-2">
               <FileText className="w-4 h-4" />
               <span>Subtitle Track</span>
             </h2>
-            <div className="flex items-center space-x-3">
-              <span className="text-xs font-mono text-slate-500 bg-slate-900 px-2 py-1 rounded">
-                {subtitles.length} segments
+            <div className="flex items-center space-x-2">
+              <span className="text-xs font-mono text-slate-500 bg-slate-900 px-2 py-1 rounded border border-slate-800 mr-2">
+                {subtitles.length} blocks
               </span>
               <button
                 onClick={() => handleAddSubtitle(null)}
@@ -609,18 +878,26 @@ export default function App() {
               >
                 <Plus className="w-4 h-4" />
               </button>
+              {subtitles.length > 0 && (
+                <button
+                  onClick={() => {
+                    if (window.confirm("Are you sure you want to clear all subtitles?")) setSubtitles([]);
+                  }}
+                  className="p-1.5 bg-rose-500/10 text-rose-400 hover:bg-rose-500/20 hover:text-rose-300 rounded transition-colors"
+                  title="Clear Track"
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              )}
             </div>
           </div>
           
-          <div 
-            className="flex-1 overflow-y-auto p-4 space-y-3"
-            ref={subtitleListRef}
-          >
+          <div className="flex-1 overflow-y-auto p-4 space-y-3" ref={subtitleListRef}>
             {subtitles.length > 0 ? subtitles.map((sub, index) => {
               const isActive = currentTime >= sub.start && currentTime <= sub.end;
               return (
                 <div 
-                  key={index} 
+                  key={sub.id + index} 
                   id={`sub-${index}`}
                   className={`group rounded-xl border p-3 transition-all ${
                     isActive 
@@ -634,7 +911,6 @@ export default function App() {
                       <button 
                         onClick={() => handleDeleteSubtitle(index)}
                         className="flex items-center space-x-1 text-rose-400 hover:text-rose-300 transition-colors opacity-0 group-hover:opacity-100"
-                        title="Delete subtitle"
                       >
                         <Trash2 className="w-4 h-4" />
                       </button>
@@ -642,7 +918,6 @@ export default function App() {
                     <button 
                       onClick={() => jumpToSubtitle(sub.start)}
                       className="flex items-center space-x-1 text-indigo-400 hover:text-indigo-300 transition-colors opacity-0 group-hover:opacity-100"
-                      title="Jump to video time"
                     >
                       <Play className="w-3 h-3" />
                       <span>Jump</span>
@@ -651,11 +926,10 @@ export default function App() {
 
                   {/* Timing Controls */}
                   <div className="flex items-center space-x-4 mb-3">
-                    {/* Start Time */}
                     <div className="flex-1 flex flex-col space-y-1">
                       <span className="text-[10px] text-slate-500 uppercase font-semibold">Start</span>
                       <div className="flex items-center justify-between bg-slate-900 rounded border border-slate-800 px-1 py-1">
-                        <button onClick={() => adjustTime(index, 'start', -0.1)} className="p-1 hover:bg-slate-800 rounded text-slate-400 hover:text-white" title="-100ms">
+                        <button onClick={() => adjustTime(index, 'start', -0.1)} className="p-1 hover:bg-slate-800 rounded text-slate-400">
                           <ChevronLeft className="w-3 h-3" />
                         </button>
                         <input 
@@ -666,17 +940,16 @@ export default function App() {
                           onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); }}
                           className="font-mono text-xs bg-transparent text-center w-[90px] outline-none text-slate-200 focus:bg-slate-800 focus:ring-1 focus:ring-indigo-500 rounded py-0.5 transition-all"
                         />
-                        <button onClick={() => adjustTime(index, 'start', 0.1)} className="p-1 hover:bg-slate-800 rounded text-slate-400 hover:text-white" title="+100ms">
+                        <button onClick={() => adjustTime(index, 'start', 0.1)} className="p-1 hover:bg-slate-800 rounded text-slate-400">
                           <ChevronRight className="w-3 h-3" />
                         </button>
                       </div>
                     </div>
 
-                    {/* End Time */}
                     <div className="flex-1 flex flex-col space-y-1">
                       <span className="text-[10px] text-slate-500 uppercase font-semibold">End</span>
                       <div className="flex items-center justify-between bg-slate-900 rounded border border-slate-800 px-1 py-1">
-                        <button onClick={() => adjustTime(index, 'end', -0.1)} className="p-1 hover:bg-slate-800 rounded text-slate-400 hover:text-white" title="-100ms">
+                        <button onClick={() => adjustTime(index, 'end', -0.1)} className="p-1 hover:bg-slate-800 rounded text-slate-400">
                           <ChevronLeft className="w-3 h-3" />
                         </button>
                         <input 
@@ -687,7 +960,7 @@ export default function App() {
                           onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); }}
                           className="font-mono text-xs bg-transparent text-center w-[90px] outline-none text-slate-200 focus:bg-slate-800 focus:ring-1 focus:ring-indigo-500 rounded py-0.5 transition-all"
                         />
-                        <button onClick={() => adjustTime(index, 'end', 0.1)} className="p-1 hover:bg-slate-800 rounded text-slate-400 hover:text-white" title="+100ms">
+                        <button onClick={() => adjustTime(index, 'end', 0.1)} className="p-1 hover:bg-slate-800 rounded text-slate-400">
                           <ChevronRight className="w-3 h-3" />
                         </button>
                       </div>
@@ -710,11 +983,21 @@ export default function App() {
                 className="h-full flex flex-col items-center justify-center text-slate-500 p-8 text-center space-y-4 cursor-pointer hover:bg-slate-800/30 rounded-xl transition-colors"
                 onClick={() => fileInputSrt.current.click()}
               >
-                <FileText className="w-12 h-12 opacity-30 text-emerald-400" />
-                <div>
-                  <p className="text-slate-300 font-medium">Upload an SRT file</p>
-                  <p className="text-sm mt-1">Click to select or <span className="text-emerald-400">drag & drop</span></p>
-                </div>
+                {transcribingJob ? (
+                  <div className="flex flex-col items-center animate-pulse">
+                    <Activity className="w-12 h-12 opacity-50 text-indigo-400 mb-4" />
+                    <p className="text-indigo-300 font-medium">Listening to audio...</p>
+                    <p className="text-sm mt-1">Subtitles will appear here shortly.</p>
+                  </div>
+                ) : (
+                  <>
+                    <FileText className="w-12 h-12 opacity-30 text-emerald-400" />
+                    <div>
+                      <p className="text-slate-300 font-medium">Upload an SRT file</p>
+                      <p className="text-sm mt-1">Click to select or <span className="text-emerald-400">drag & drop</span></p>
+                    </div>
+                  </>
+                )}
               </div>
             )}
           </div>
