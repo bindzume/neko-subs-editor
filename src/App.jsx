@@ -566,6 +566,13 @@ export default function App() {
               Generate subtitles locally. You can watch the video and edit subtitles live as they stream in!
             </p>
 
+            <div className="bg-amber-500/10 border border-amber-500/20 rounded-lg p-3 mb-6 flex items-start space-x-3">
+              <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+              <p className="text-xs text-amber-200/90 leading-relaxed">
+                <strong>Note:</strong> AI transcription cannot be 100% accurate. Please make sure to double-check the generated subtitles for accuracy.
+              </p>
+            </div>
+
             <div className="space-y-4 mb-8">
               <div className="space-y-2">
                 <label className="text-sm font-semibold text-slate-300">Spoken Language</label>
