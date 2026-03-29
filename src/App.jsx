@@ -427,7 +427,59 @@ export default function App() {
   const assContentRef = useRef('');
   const canvasRef = useRef(null);
 
-  // Initialize JASSUB when entering ASS mode with a video loaded
+  // Manual reload function for ASS subtitles
+  const reloadAssSubtitles = () => {
+    if (subtitleMode !== 'ass' || !videoRef.current || !videoContainerRef.current) return;
+
+    const currentVideoTime = videoRef.current.currentTime;
+
+    // Destroy old instance
+    if (jassubRef.current) {
+      jassubRef.current.destroy();
+      jassubRef.current = null;
+    }
+    // Remove old canvas
+    if (canvasRef.current) {
+      canvasRef.current.remove();
+      canvasRef.current = null;
+    }
+    const oldCanvas = videoContainerRef.current.querySelector('canvas');
+    if (oldCanvas) oldCanvas.remove();
+
+    // Create a fresh canvas
+    const canvas = document.createElement('canvas');
+    canvas.style.position = 'absolute';
+    canvas.style.top = '0';
+    canvas.style.left = '0';
+    canvas.style.width = '100%';
+    canvas.style.height = '100%';
+    canvas.style.pointerEvents = 'none';
+    canvas.style.objectFit = 'contain';
+    canvas.style.zIndex = '10';
+    videoContainerRef.current.appendChild(canvas);
+    canvasRef.current = canvas;
+
+    const assContent = stringifyASS(subtitles, assDefaultStyle);
+    assContentRef.current = assContent;
+
+    try {
+      jassubRef.current = new JASSUB({
+        video: videoRef.current,
+        canvas: canvas,
+        subContent: assContent,
+      });
+
+      // Force a tiny time update to trigger renderer if video is paused
+      if (videoRef.current.paused && currentVideoTime > 0) {
+        videoRef.current.currentTime = currentVideoTime + 0.001;
+      }
+    } catch (err) {
+      console.error('JASSUB reload failed:', err);
+      setParseWarnings(['Failed to reload ASS renderer: ' + err.message]);
+    }
+  };
+
+  // Initialize JASSUB only once when entering ASS mode
   useEffect(() => {
     if (subtitleMode !== 'ass' || !videoUrl || !videoRef.current || !videoContainerRef.current) {
       if (jassubRef.current) {
@@ -447,7 +499,7 @@ export default function App() {
         jassubRef.current.destroy();
         jassubRef.current = null;
       }
-      // Remove old canvas to prevent OffscreenCanvas crash
+      // Remove old canvas
       if (canvasRef.current) {
         canvasRef.current.remove();
         canvasRef.current = null;
@@ -455,7 +507,7 @@ export default function App() {
       const oldCanvas = videoContainerRef.current.querySelector('canvas');
       if (oldCanvas) oldCanvas.remove();
 
-      // Create a fresh canvas (matching the working TestApp pattern)
+      // Create a fresh canvas
       const canvas = document.createElement('canvas');
       canvas.style.position = 'absolute';
       canvas.style.top = '0';
@@ -502,20 +554,6 @@ export default function App() {
       }
     };
   }, [subtitleMode, videoUrl]);
-
-  // Update JASSUB track content when subtitles or style change
-  useEffect(() => {
-    if (subtitleMode !== 'ass' || !jassubRef.current) return;
-    const newContent = stringifyASS(subtitles, assDefaultStyle);
-    if (newContent !== assContentRef.current) {
-      assContentRef.current = newContent;
-      try {
-        jassubRef.current.setTrack(newContent);
-      } catch (err) {
-        console.error('Failed to update JASSUB track:', err);
-      }
-    }
-  }, [subtitles, assDefaultStyle, subtitleMode]);
 
   // --- Handlers ---
   const processVideoFile = (file) => {
@@ -1159,12 +1197,22 @@ export default function App() {
                   </button>
 
                   {subtitles.length > 0 && (
-                    <button 
+                    <button
                       onClick={handleJumpToCurrentFragment}
                       className="flex items-center space-x-2 bg-slate-800 hover:bg-slate-700 px-4 py-2.5 rounded-xl border border-slate-700 shadow-lg transition-colors text-slate-300"
                     >
                       <Target className="w-5 h-5 text-indigo-400" />
                       <span className="text-sm font-medium">Jump to Subtitle</span>
+                    </button>
+                  )}
+
+                  {subtitles.length > 0 && subtitleMode === 'ass' && (
+                    <button
+                      onClick={reloadAssSubtitles}
+                      className="flex items-center space-x-2 bg-purple-600/20 hover:bg-purple-600/30 px-4 py-2.5 rounded-xl border border-purple-500/30 shadow-lg transition-colors text-purple-300"
+                    >
+                      <Sparkles className="w-5 h-5" />
+                      <span className="text-sm font-medium">Reload Subtitles</span>
                     </button>
                   )}
                 </div>
